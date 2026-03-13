@@ -1,0 +1,610 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  Search, 
+  Calendar, 
+  Hash, 
+  ExternalLink, 
+  Loader2, 
+  Rss, 
+  ArrowRight,
+  Filter, 
+  RefreshCw,
+  Clock,
+  BookOpen,
+  LayoutGrid,
+  List,
+  AlertCircle,
+  AppWindow,
+  Star,
+  StarOff,
+  Trash2,
+  ChevronDown,
+  Plus,
+  Check,
+  CalendarDays,
+  Info,
+  X,
+  ChevronRight,
+  Zap,
+  Settings,
+  Moon,
+  Sun,
+  History,
+  Target,
+  Download,
+  CheckSquare,
+  Square
+} from 'lucide-react';
+
+/**
+ * RSS TIMELINE & RELEASE CALENDAR - FULLY FUNCTIONAL PROXY VERSION
+ * - High-density UI
+ * - Tagging & CSV Export
+ * - Cache-busting refresh (Fixed for CORS/Proxy reliability)
+ */
+
+const COMMON_APPS = [
+  "Apple", "Google", "Microsoft", "Meta", "Facebook", "Instagram", "Twitter", "X", 
+  "YouTube", "TikTok", "Netflix", "Amazon", "OpenAI", "ChatGPT", "Slack", "Discord", 
+  "Spotify", "Disney", "Tesla", "Samsung", "Reddit", "Zoom", "WhatsApp", "GitHub",
+  "Outlook", "Teams", "SharePoint", "Office", "Azure"
+];
+
+const INITIAL_FEEDS = [
+  { name: 'M365 Releases', url: 'https://microsoft.com/releasecommunications/api/v2/m365/rss' },
+  { name: 'The Verge', url: 'https://www.theverge.com/rss/index.xml' }
+];
+
+const parseReleaseText = (text) => {
+  if (!text) return null;
+  const cleanText = text.replace(/CY(\d{4})/gi, '$1').trim();
+  const monthRegex = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i;
+  const monthMatch = cleanText.match(monthRegex);
+  if (monthMatch) return new Date(parseInt(monthMatch[2]), new Date(`${monthMatch[1]} 1, ${monthMatch[2]}`).getMonth(), 1);
+  const quarterRegex = /Q([1-4])\s+(\d{4})/i;
+  const quarterMatch = cleanText.match(quarterRegex);
+  if (quarterMatch) return new Date(parseInt(quarterMatch[2]), (parseInt(quarterMatch[1]) - 1) * 3, 1);
+  return null;
+};
+
+const extractReleaseIntelligence = (text) => {
+  if (!text) return { gaDate: null, previewDate: null, gaLabel: null, previewLabel: null };
+  const gaPattern = /\b(?:GA\s*date|General Availability|GA)\b\s*[:\-]?\s*(.+?)(?=(?:\bPreview\s*date\b|\bPublic Preview\b|\bPreview\b)|[\n<,.]|$)/i;
+  const previewPattern = /\b(?:Preview\s*date\b|Public Preview|Preview)\b\s*[:\-]?\s*(.+?)(?=(?:\bGA\s*date\b|\bGeneral Availability\b|\bGA\b)|[\n<,.]|$)/i;
+  const gaMatch = text.match(gaPattern);
+  const previewMatch = text.match(previewPattern);
+  const gaLabel = gaMatch ? gaMatch[1].trim() : null;
+  const previewLabel = previewMatch ? previewMatch[1].trim() : null;
+  return { 
+    gaDate: parseReleaseText(gaLabel), 
+    previewDate: parseReleaseText(previewLabel), 
+    gaLabel, 
+    previewLabel 
+  };
+};
+
+const App = () => {
+  const [isDarkMode, setIsDarkMode] = useState(() => localStorage.getItem('rss_dark_mode') === 'true');
+  const [syncDays, setSyncDays] = useState(() => parseInt(localStorage.getItem('rss_sync_days')) || 15);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [feedUrl, setFeedUrl] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [feedData, setFeedData] = useState(null);
+  const [items, setItems] = useState([]);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedApp, setSelectedApp] = useState('All');
+  const [viewMode, setViewMode] = useState('timeline');
+  const [activeItem, setActiveItem] = useState(null);
+  const [taggedItemIds, setTaggedItemIds] = useState(new Set());
+  const [error, setError] = useState(null);
+  
+  const [perFeedSelections, setPerFeedSelections] = useState(() => JSON.parse(localStorage.getItem('rss_per_feed_selections')) || {});
+  const [savedFeeds, setSavedFeeds] = useState(() => JSON.parse(localStorage.getItem('rss_saved_feeds')) || INITIAL_FEEDS);
+  const [favoriteApps, setFavoriteApps] = useState(() => JSON.parse(localStorage.getItem('rss_fav_apps')) || []);
+  const [favoriteCategories, setFavoriteCategories] = useState(() => JSON.parse(localStorage.getItem('rss_fav_categories')) || {});
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem('rss_dark_mode', isDarkMode);
+    localStorage.setItem('rss_sync_days', syncDays);
+    localStorage.setItem('rss_saved_feeds', JSON.stringify(savedFeeds));
+    localStorage.setItem('rss_fav_apps', JSON.stringify(favoriteApps));
+    localStorage.setItem('rss_fav_categories', JSON.stringify(favoriteCategories));
+    localStorage.setItem('rss_per_feed_selections', JSON.stringify(perFeedSelections));
+  }, [isDarkMode, syncDays, savedFeeds, favoriteApps, favoriteCategories, perFeedSelections]);
+
+  useEffect(() => {
+    if (savedFeeds.length > 0) {
+      const initial = savedFeeds[0].url;
+      setFeedUrl(initial);
+      fetchFeed(initial);
+    }
+  }, []);
+
+  const fetchWithRetry = async (targetUrl) => {
+    let lastError = null;
+    
+    // Fallback proxy list that returns raw XML directly
+    const proxyUrls = [
+      `https://corsproxy.io/?url=${encodeURIComponent(targetUrl + '?cb=' + Date.now())}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl + '?cb=' + Date.now())}`,
+      `https://thingproxy.freeboard.io/fetch/${targetUrl}?cb=${Date.now()}`
+    ];
+    
+    for (let proxyUrl of proxyUrls) {
+      try {
+        const response = await fetch(proxyUrl);
+        if (response.ok) {
+           const text = await response.text();
+           // Very basic validation to ensure it's not a generic HTML error page
+           if (text && text.trim().length > 0 && !text.trim().toLowerCase().startsWith('<!doctype html')) {
+               return text;
+           } else {
+               lastError = new Error(`Proxy returned HTML instead of XML.`);
+               console.warn(`Proxy ${proxyUrl} returned HTML.`);
+           }
+        } else {
+             lastError = new Error(`Proxy responded with status: ${response.status}`);
+             console.warn(`Proxy ${proxyUrl} responded with status: ${response.status}`);
+        }
+      } catch (err) { 
+        lastError = err; 
+        console.warn(`Proxy failed:`, err);
+      }
+    }
+    throw lastError || new Error("Proxy connection failed. Cross-Origin endpoints may be down.");
+  };
+
+  const fetchFeed = async (url) => {
+    const fetchTarget = url || feedUrl || feedData?.url;
+    if (!fetchTarget) return;
+    
+    setLoading(true);
+    setError(null);
+    try {
+      const xmlString = await fetchWithRetry(fetchTarget);
+      
+      if (!xmlString) {
+          throw new Error("No data received from proxy.");
+      }
+
+      const parser = new DOMParser();
+      const xmlDoc = parser.parseFromString(xmlString, "text/xml");
+      
+      const parseErrorNode = xmlDoc.querySelector('parsererror');
+      if (parseErrorNode) {
+          console.error("XML Parsing Error details:", parseErrorNode.textContent);
+          // Don't throw immediately, as some browsers inject parsererror but still parse the rest
+          if (xmlDoc.documentElement.nodeName === "parsererror") {
+              throw new Error("Invalid RSS/XML data returned from server. Could not parse XML.");
+          }
+      }
+      
+      const isAtom = xmlDoc.getElementsByTagName('feed').length > 0;
+      const isRss = xmlDoc.getElementsByTagName('rss').length > 0 || xmlDoc.getElementsByTagName('channel').length > 0;
+
+      if (!isAtom && !isRss) {
+         throw new Error("Data returned is neither valid RSS nor Atom format.");
+      }
+
+      let channelTitle = isAtom ? xmlDoc.querySelector('title')?.textContent : xmlDoc.querySelector('channel > title')?.textContent;
+      if (channelTitle) {
+        channelTitle = channelTitle.split(' - ')[0].replace(/Roadmap/gi, '').trim();
+        if (channelTitle.toLowerCase().includes('microsoft 365')) channelTitle = 'M365 Releases';
+      }
+
+      const entries = isAtom ? Array.from(xmlDoc.querySelectorAll('entry')) : Array.from(xmlDoc.querySelectorAll('item'));
+      if (entries.length === 0) {
+        throw new Error("No feed items found. The feed might be empty.");
+      }
+
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - syncDays);
+
+      const parsedItems = entries.map((entry, index) => {
+        const title = (entry.querySelector('title')?.textContent || 'Untitled').trim();
+        const link = isAtom ? (entry.querySelector('link[rel="alternate"]')?.getAttribute('href') || entry.querySelector('link')?.getAttribute('href')) : entry.querySelector('link')?.textContent;
+        const pubDateStr = isAtom ? entry.querySelector('published, updated')?.textContent : entry.querySelector('pubDate')?.textContent;
+        const descriptionRaw = isAtom ? (entry.querySelector('summary')?.textContent || entry.querySelector('content')?.textContent) : entry.querySelector('description')?.textContent;
+        const fullDesc = descriptionRaw ? descriptionRaw.replace(/<[^>]*>?/gm, '').trim() : '';
+        const date = pubDateStr ? new Date(pubDateStr) : new Date();
+        if (date < cutoffDate) return null;
+        const releaseIntel = extractReleaseIntelligence(fullDesc);
+        const combinedText = (title + " " + fullDesc).toLowerCase();
+        const detectedApps = COMMON_APPS.filter(app => combinedText.includes(app.toLowerCase()));
+        let category = 'Uncategorized';
+        const catNodes = entry.querySelectorAll('category');
+        if (catNodes.length > 0) category = catNodes[0].getAttribute('term') || catNodes[0].textContent || 'Uncategorized';
+        return {
+          id: `${index}-${date.getTime()}-${Math.random()}`,
+          title, link, date, gaDate: releaseIntel.gaDate, previewDate: releaseIntel.previewDate,
+          gaLabel: releaseIntel.gaLabel, previewLabel: releaseIntel.previewLabel,
+          description: fullDesc.substring(0, 250), fullContent: fullDesc, category: category.trim(), detectedApps
+        };
+      }).filter(Boolean);
+
+      parsedItems.sort((a, b) => b.date - a.date);
+      setFeedData({ title: channelTitle || 'RSS Feed', url: fetchTarget });
+      setItems(parsedItems);
+      addSavedFeed(channelTitle || fetchTarget, fetchTarget);
+    } catch (err) { 
+      console.error(err); 
+      setError(err.message || "Failed to load feed.");
+    } finally { 
+      setLoading(false); 
+    }
+  };
+
+  const addSavedFeed = (name, url) => {
+    if (!savedFeeds.some(f => f.url === url)) setSavedFeeds(prev => [{ name, url }, ...prev]);
+  };
+
+  const toggleTag = (e, itemId) => {
+    if (e) e.stopPropagation();
+    setTaggedItemIds(prev => {
+      const next = new Set(prev);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  };
+
+  const exportTaggedToCSV = () => {
+    const taggedItems = items.filter(i => taggedItemIds.has(i.id));
+    if (taggedItems.length === 0) return;
+    setExporting(true);
+    const headers = ["Title", "Link", "Published Date", "GA Release Label", "GA Date (Parsed)", "Preview Release Label", "Preview Date (Parsed)", "Category", "Apps/Brands Detected", "Full Description Content"];
+    const rows = taggedItems.map(i => [
+      `"${(i.title || '').replace(/"/g, '""')}"`,
+      `"${(i.link || '')}"`,
+      `"${i.date ? i.date.toLocaleDateString() : ''}"`,
+      `"${(i.gaLabel || '').replace(/"/g, '""')}"`,
+      `"${i.gaDate ? i.gaDate.toLocaleDateString() : ''}"`,
+      `"${(i.previewLabel || '').replace(/"/g, '""')}"`,
+      `"${(i.previewDate ? i.previewDate.toLocaleDateString() : '')}"`,
+      `"${(i.category || '').replace(/"/g, '""')}"`,
+      `"${(i.detectedApps || []).join(', ').replace(/"/g, '""')}"`,
+      `"${(i.fullContent || '').replace(/"/g, '""')}"`
+    ]);
+    const csvString = [headers.join(","), ...rows.map(r => r.join(","))].join("\r\n");
+    const BOM = "\uFEFF";
+    const blob = new Blob([BOM + csvString], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `RSS_Export_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setTimeout(() => { setExporting(false); setTaggedItemIds(new Set()); }, 1500);
+  };
+
+  const selectedCategories = useMemo(() => {
+    if (!feedData?.url) return ['All'];
+    return perFeedSelections[feedData.url] || ['All'];
+  }, [perFeedSelections, feedData]);
+
+  const availableCategories = useMemo(() => {
+    const cats = new Set(['All']);
+    items.forEach(item => cats.add(item.category));
+    return Array.from(cats).sort();
+  }, [items]);
+
+  const currentFeedFavCats = useMemo(() => favoriteCategories[feedData?.url] || [], [favoriteCategories, feedData]);
+
+  const filteredItems = useMemo(() => {
+    return items.filter(item => {
+      const matchesSearch = item.title.toLowerCase().includes(searchTerm.toLowerCase()) || item.fullContent.toLowerCase().includes(searchTerm.toLowerCase());
+      const matchesCat = selectedCategories.includes('All') || selectedCategories.includes(item.category);
+      const matchesApp = selectedApp === 'All' || item.detectedApps.includes(selectedApp);
+      const isFavApp = item.detectedApps.some(app => favoriteApps.includes(app));
+      const isFavCat = currentFeedFavCats.includes(item.category);
+      const matchesFavorites = !showFavoritesOnly || (isFavApp || isFavCat);
+      return matchesSearch && matchesCat && matchesApp && matchesFavorites;
+    });
+  }, [items, searchTerm, selectedCategories, selectedApp, favoriteApps, currentFeedFavCats, showFavoritesOnly]);
+
+  return (
+    <div className={`min-h-screen font-sans transition-colors duration-300 ${isDarkMode ? 'bg-slate-950 text-slate-100 dark' : 'bg-slate-50 text-slate-900'}`}>
+      <header className={`sticky top-0 z-50 backdrop-blur-md border-b h-12 flex items-center transition-colors ${isDarkMode ? 'bg-slate-950/80 border-slate-800' : 'bg-white/80 border-slate-200'}`}>
+        <div className="max-w-6xl mx-auto px-4 w-full flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <div className="p-1 bg-indigo-600 rounded shadow shrink-0"><Rss className="w-3.5 h-3.5 text-white" /></div>
+            <h1 className="text-sm font-black bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-violet-500 hidden md:block uppercase tracking-tighter">RSS Release</h1>
+          </div>
+          <div className="flex-1 max-w-2xl flex gap-2">
+            <div className="relative group hidden sm:block shrink-0">
+              <select onChange={(e) => { setFeedUrl(e.target.value); fetchFeed(e.target.value); }} value={feedData?.url || ''} className={`appearance-none border-none rounded-lg px-2 pr-6 py-1 text-[10px] font-bold focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer h-full min-w-[100px] transition-colors ${isDarkMode ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-700'}`}>
+                <option value="" disabled>Saved Sites</option>
+                {savedFeeds.map(f => <option key={f.url} value={f.url}>{f.name}</option>)}
+              </select>
+              <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400 pointer-events-none" />
+            </div>
+            <div className="relative flex-1">
+              <Search className="absolute left-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400" />
+              <input type="text" placeholder="RSS URL..." className={`w-full pl-7 pr-2 py-1 focus:ring-2 focus:ring-indigo-500 rounded-lg outline-none text-[10px] transition-all ${isDarkMode ? 'bg-slate-800 focus:bg-slate-700 text-white' : 'bg-slate-100 focus:bg-white text-slate-900'}`} value={feedUrl} onChange={(e) => setFeedUrl(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && fetchFeed(feedUrl || feedData?.url)} />
+            </div>
+            <button onClick={() => fetchFeed(feedUrl || feedData?.url)} disabled={loading} className="p-1 px-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors shadow-sm">{loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}</button>
+            <button onClick={() => setSettingsOpen(true)} className={`p-1 rounded-lg border transition-colors ${isDarkMode ? 'bg-slate-800 border-slate-700 hover:bg-slate-700' : 'bg-white border-slate-200 hover:bg-slate-50'}`}><Settings className="w-3.5 h-3.5 text-slate-400" /></button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 py-4 flex flex-col md:flex-row gap-5 mb-24">
+        <aside className="w-full md:w-48 lg:w-56 space-y-5 shrink-0">
+          <div className="p-2.5 bg-gradient-to-br from-indigo-600 to-violet-700 rounded-xl text-white shadow-md space-y-1.5">
+            <div className="flex items-center justify-between"><label className="text-[7px] font-black uppercase tracking-widest opacity-80">FAVORITES</label><Star className="w-3 h-3" /></div>
+            <button onClick={() => setShowFavoritesOnly(!showFavoritesOnly)} className={`w-full py-1 px-2 rounded-lg text-[8px] font-black transition-all uppercase tracking-widest ${showFavoritesOnly ? 'bg-white text-indigo-600' : 'bg-white/20 text-white hover:bg-white/30'}`}>{showFavoritesOnly ? 'Starred Only' : 'Full Sync'}</button>
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-[7px] font-black uppercase tracking-widest text-slate-400 flex items-center gap-1.5 px-1"><Hash className="w-2.5 h-2.5" /> CATEGORIES</label>
+            <div className="flex flex-wrap md:flex-col gap-1">
+              {availableCategories.map(cat => (
+                <button key={cat} onClick={() => {
+                  if (!feedData?.url) return;
+                  setPerFeedSelections(prev => {
+                    let cur = prev[feedData.url] || ['All'];
+                    let nxt = cat === 'All' ? ['All'] : (cur.includes(cat) ? cur.filter(c => c !== cat) : [...cur.filter(c => c !== 'All'), cat]);
+                    if (nxt.length === 0) nxt = ['All'];
+                    return { ...prev, [feedData.url]: nxt };
+                  });
+                }} className={`group px-2 py-1 rounded-lg text-[8px] flex items-center justify-between transition-all border ${selectedCategories.includes(cat) ? 'bg-indigo-600 border-indigo-600 text-white' : (isDarkMode ? 'bg-slate-900 border-slate-800 text-slate-400 hover:border-indigo-500' : 'bg-white border-slate-100 text-slate-600 hover:border-indigo-200')}`}>
+                  <div className="flex items-center gap-1 min-w-0">{selectedCategories.includes(cat) && <Check className="w-2 h-2 shrink-0" />}<span className="truncate">{cat}</span></div>
+                  {cat !== 'All' && <div onClick={(e) => { e.stopPropagation(); setFavoriteCategories(p => ({ ...p, [feedData.url]: (p[feedData.url] || []).includes(cat) ? p[feedData.url].filter(c => c !== cat) : [...(p[feedData.url] || []), cat] })); }} className={`p-0.5 rounded transition-colors ${currentFeedFavCats.includes(cat) ? 'text-yellow-400' : 'text-slate-300 hover:text-yellow-400 opacity-0 group-hover:opacity-100'}`}><Star className="w-2.5 h-2.5" /></div>}
+                </button>
+              ))}
+            </div>
+          </div>
+        </aside>
+
+        <section className="flex-1 space-y-3 min-w-0">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="space-y-0.5">
+              <h2 className="text-xs font-black tracking-tight uppercase truncate">{feedData?.title || 'Stories'}</h2>
+              <p className="text-[7px] text-slate-400 font-bold uppercase tracking-widest">{filteredItems.length} Stories • {syncDays}d window</p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="relative">
+                <Search className="absolute left-1.5 top-1/2 -translate-y-1/2 w-2.5 h-2.5 text-slate-400" />
+                <input type="text" placeholder="Search..." className={`pl-5 pr-2 py-1 border rounded-lg text-[9px] outline-none focus:ring-2 focus:ring-indigo-500 w-24 sm:w-32 transition-all ${isDarkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`} value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+              </div>
+              <div className={`flex p-0.5 rounded-lg border transition-colors ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <button onClick={() => setViewMode('timeline')} className={`p-1 rounded-md transition-all ${viewMode === 'timeline' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-indigo-500'}`} title="Timeline View"><List className="w-2.5 h-2.5" /></button>
+                <button onClick={() => setViewMode('grid')} className={`p-1 rounded-md transition-all ${viewMode === 'grid' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-indigo-500'}`} title="Grid View"><LayoutGrid className="w-2.5 h-2.5" /></button>
+                <button onClick={() => setViewMode('calendar')} className={`p-1 rounded-md transition-all ${viewMode === 'calendar' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-indigo-500'}`} title="Release Calendar"><CalendarDays className="w-2.5 h-2.5" /></button>
+              </div>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-32 space-y-3">
+              <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+              <p className="text-slate-400 font-black text-[7px] tracking-[0.2em] uppercase">Syncing...</p>
+            </div>
+          ) : error && items.length === 0 ? (
+            <div className={`text-center py-32 rounded-3xl border-2 border-dashed ${isDarkMode ? 'bg-slate-950 border-red-900/30' : 'bg-white border-red-200'}`}>
+              <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+              <h3 className="text-[10px] font-black uppercase text-red-500">Sync Error</h3>
+              <p className="text-slate-400 text-[10px] mt-1">{error}</p>
+            </div>
+          ) : viewMode === 'calendar' ? (
+            <CalendarView items={filteredItems} isDarkMode={isDarkMode} onStoryClick={(s) => setActiveItem(s)} taggedItemIds={taggedItemIds} onTagToggle={toggleTag} />
+          ) : filteredItems.length > 0 ? (
+            <div className={viewMode === 'timeline' 
+              ? `relative pl-6 sm:pl-8 space-y-2 before:absolute before:left-2 sm:before:left-3 before:top-1 before:bottom-1 before:w-0.5 ${isDarkMode ? 'before:bg-slate-800' : 'before:bg-slate-200'}` 
+              : "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2"
+            }>
+              {filteredItems.map((item) => (
+                <ArticleCard key={item.id} item={item} viewMode={viewMode} favCats={currentFeedFavCats} isDarkMode={isDarkMode} isTagged={taggedItemIds.has(item.id)} onTagToggle={(e) => toggleTag(e, item.id)} onClick={() => setActiveItem(item)} />
+              ))}
+            </div>
+          ) : (
+            <div className={`text-center py-32 rounded-3xl border-2 border-dashed ${isDarkMode ? 'bg-slate-950 border-slate-800' : 'bg-white border-slate-200'}`}>
+              <StarOff className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+              <h3 className="text-[10px] font-black uppercase">No results</h3>
+            </div>
+          )}
+        </section>
+      </main>
+
+      {/* EXPORT ACTION BAR */}
+      {taggedItemIds.size > 0 && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[150] w-[90%] max-w-sm animate-in slide-in-from-bottom-6 duration-300">
+           <div className={`p-3 rounded-2xl shadow-2xl flex items-center justify-between border ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-indigo-100'}`}>
+              <div className="flex items-center gap-2.5">
+                 <div className="w-7 h-7 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-black text-xs">{taggedItemIds.size}</div>
+                 <div><p className="text-[9px] font-black uppercase tracking-widest leading-none">Export List</p><button onClick={() => setTaggedItemIds(new Set())} className="text-[7px] font-bold text-slate-400 hover:text-red-500 transition-colors uppercase mt-0.5">Reset</button></div>
+              </div>
+              <button onClick={exportTaggedToCSV} disabled={exporting} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest shadow shadow-indigo-500/20 disabled:opacity-50 transition-all">{exporting ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}{exporting ? 'Wait' : 'Export'}</button>
+           </div>
+        </div>
+      )}
+
+      {/* SETTINGS MODAL */}
+      {settingsOpen && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md animate-in fade-in" onClick={() => setSettingsOpen(false)}>
+          <div className={`w-full max-w-xs rounded-2xl shadow-2xl overflow-hidden animate-in zoom-in-95 ${isDarkMode ? 'bg-slate-900 border border-slate-800' : 'bg-white'}`} onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-3 border-b flex items-center justify-between dark:border-slate-800">
+              <h3 className="font-black text-[10px] uppercase tracking-widest">Preferences</h3>
+              <button onClick={() => setSettingsOpen(false)} className="p-1 rounded-full"><X className="w-4 h-4 text-slate-400" /></button>
+            </div>
+            <div className="p-5 space-y-6">
+              <div className="flex items-center justify-between">
+                <span className="text-[9px] font-black uppercase tracking-widest">Dark Mode</span>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" className="sr-only peer" checked={isDarkMode} onChange={() => setIsDarkMode(!isDarkMode)} />
+                  <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                </label>
+              </div>
+              <div className="space-y-2">
+                <span className="text-[9px] font-black uppercase tracking-widest">Sync Window (Days)</span>
+                <input type="number" value={syncDays} onChange={(e) => setSyncDays(Math.max(1, parseInt(e.target.value) || 0))} className={`w-full px-3 py-1.5 rounded-lg text-[10px] font-black outline-none focus:ring-2 focus:ring-indigo-500 ${isDarkMode ? 'bg-slate-800 text-white border-slate-700' : 'bg-slate-100 text-slate-900 border-slate-200'}`} />
+              </div>
+            </div>
+            <div className="p-3 bg-slate-50 dark:bg-slate-800/50 flex justify-center">
+              <button onClick={() => { setSettingsOpen(false); fetchFeed(feedData?.url); }} className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[8px] font-black uppercase tracking-[0.2em]">Save & Reload</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* STORY DETAIL MODAL */}
+      {activeItem && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center p-3 bg-slate-900/40 backdrop-blur-sm animate-in fade-in" onClick={() => setActiveItem(null)}>
+          <div className={`w-full max-w-xl max-h-[85vh] overflow-hidden rounded-2xl shadow-2xl flex flex-col animate-in zoom-in-95 ${isDarkMode ? 'bg-slate-900 border border-slate-800 text-slate-200' : 'bg-white'}`} onClick={e => e.stopPropagation()}>
+            <div className={`px-5 py-3 border-b flex items-start justify-between gap-4 shrink-0 ${isDarkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+              <div className="space-y-1 min-w-0 flex-1">
+                <span className="text-[6px] font-black bg-indigo-600 text-white px-1.5 py-0.5 rounded uppercase tracking-widest">{activeItem.category}</span>
+                <h3 className="text-[12px] font-black leading-tight pr-6">{activeItem.title}</h3>
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {activeItem.gaLabel && <span className="text-[7px] font-black text-emerald-600 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 uppercase">GA: {activeItem.gaLabel}</span>}
+                  {activeItem.previewLabel && <span className="text-[7px] font-black text-amber-500 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-100 uppercase">Prev: {activeItem.previewLabel}</span>}
+                </div>
+              </div>
+              <button onClick={() => setActiveItem(null)} className="p-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors shrink-0"><X className="w-4 h-4 text-slate-400" /></button>
+            </div>
+            <div className={`flex-1 overflow-y-auto px-5 py-5 space-y-4 custom-scrollbar ${isDarkMode ? 'bg-slate-950' : 'bg-slate-50/20'}`}>
+              <div className={`relative rounded-xl border shadow-sm overflow-hidden flex flex-col ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
+                <div className={`px-4 py-1.5 border-b flex items-center gap-1.5 ${isDarkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-100'}`}><BookOpen className="w-2.5 h-2.5" /><span className="text-[7px] font-black uppercase tracking-widest">Story context</span></div>
+                <div className="px-4 py-5 text-[12px] leading-[1.6] whitespace-pre-wrap font-medium relative min-h-[250px]" style={{ backgroundImage: `linear-gradient(${isDarkMode ? '#1e293b' : '#f1f5f9'} 1px, transparent 1px)`, backgroundSize: '100% 1.6em', backgroundAttachment: 'local' }}>{activeItem.fullContent}</div>
+              </div>
+            </div>
+            <div className={`px-5 py-3 border-t flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
+              <span className="text-[8px] text-slate-500 font-bold uppercase tracking-tighter">Announced: {activeItem.date.toLocaleDateString()}</span>
+              <a href={activeItem.link} target="_blank" rel="noopener noreferrer" className="w-full sm:w-auto px-6 py-2 bg-indigo-600 text-white font-black text-[8px] uppercase tracking-[0.15em] rounded-xl shadow transition-all flex items-center justify-center gap-1.5 group">SOURCE <ExternalLink className="w-3 h-3" /></a>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const CalendarView = ({ items, isDarkMode, onStoryClick, taggedItemIds, onTagToggle }) => {
+  const [releaseTypeFilter, setReleaseTypeFilter] = useState('both');
+  const [selectedDayItems, setSelectedDayItems] = useState(null);
+  const months = useMemo(() => {
+    const res = [];
+    const now = new Date();
+    for (let i = 0; i < 3; i++) res.push(new Date(now.getFullYear(), now.getMonth() - i, 1));
+    return res;
+  }, []);
+  const stats = useMemo(() => {
+    const data = {};
+    items.forEach(item => {
+      const announcedKey = item.date.toISOString().split('T')[0];
+      if (!data[announcedKey]) data[announcedKey] = { announced: [], projected: [] };
+      data[announcedKey].announced.push(item);
+      let releaseDate = releaseTypeFilter === 'ga' ? item.gaDate : (releaseTypeFilter === 'preview' ? item.previewDate : (item.gaDate || item.previewDate));
+      if (releaseDate) {
+        const releaseKey = releaseDate.toISOString().split('T')[0];
+        if (!data[releaseKey]) data[releaseKey] = { announced: [], projected: [] };
+        data[releaseKey].projected.push(item);
+      }
+    });
+    return data;
+  }, [items, releaseTypeFilter]);
+
+  return (
+    <div className="space-y-5 animate-in fade-in duration-500">
+      <div className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
+        <div className="flex items-center gap-2">
+          <CalendarDays className="w-3.5 h-3.5 text-indigo-400" />
+          <h3 className="text-[9px] font-black uppercase tracking-wider">Release Mapping</h3>
+        </div>
+        <div className={`flex p-0.5 rounded-lg border ${isDarkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-100'}`}>
+          {['ga', 'preview', 'both'].map(f => <button key={f} onClick={() => setReleaseTypeFilter(f)} className={`px-2 py-1 rounded text-[7px] font-black uppercase tracking-widest transition-all ${releaseTypeFilter === f ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400'}`}>{f.toUpperCase()}</button>)}
+        </div>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">{months.map((monthDate, idx) => (
+        <MonthGrid key={idx} date={monthDate} stats={stats} isDarkMode={isDarkMode} onDaySelect={(items) => setSelectedDayItems(items)} />
+      ))}</div>
+      {selectedDayItems && (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center p-3 bg-slate-900/60 backdrop-blur-md animate-in fade-in" onClick={() => setSelectedDayItems(null)}>
+          <div className={`w-full max-w-sm max-h-[70vh] overflow-hidden rounded-2xl shadow-2xl flex flex-col animate-in zoom-in-95 ${isDarkMode ? 'bg-slate-900 border border-slate-800 text-slate-200' : 'bg-white'}`} onClick={e => e.stopPropagation()}>
+            <div className={`px-4 py-3 border-b flex items-center justify-between ${isDarkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+              <h3 className="text-[9px] font-black uppercase tracking-widest">{selectedDayItems.dateLabel}</h3>
+              <button onClick={() => setSelectedDayItems(null)} className="p-1"><X className="w-3 h-3 text-slate-400" /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
+              {[...selectedDayItems.announced, ...selectedDayItems.projected].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i).map(item => (
+                <div key={item.id} className={`p-2 rounded-lg border flex items-center justify-between gap-2 transition-all ${isDarkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex-1 min-w-0 cursor-pointer" onClick={() => { onStoryClick(item); setSelectedDayItems(null); }}><p className="text-[10px] font-bold leading-tight truncate">{item.title}</p></div>
+                  <button onClick={(e) => onTagToggle(e, item.id)} className={`p-1 rounded border ${taggedItemIds.has(item.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-300 text-slate-400 opacity-50'}`}>{taggedItemIds.has(item.id) ? <CheckSquare className="w-2.5 h-2.5" /> : <Square className="w-2.5 h-2.5" />}</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MonthGrid = ({ date, stats, isDarkMode, onDaySelect }) => {
+  const monthName = date.toLocaleString('default', { month: 'long', year: 'numeric' });
+  const firstDay = new Date(date.getFullYear(), date.getMonth(), 1).getDay();
+  const daysInMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+  return (
+    <div className={`rounded-xl border p-2 shadow-sm ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
+      <h3 className="text-[8px] font-black uppercase tracking-widest mb-2 text-center">{monthName}</h3>
+      <div className="grid grid-cols-7 gap-0.5">
+        {Array.from({ length: firstDay }).map((_, i) => <div key={`b-${i}`} className="aspect-square" />)}
+        {Array.from({ length: daysInMonth }).map((_, i) => {
+          const d = i + 1;
+          const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+          const s = stats[key];
+          const hasActivity = s?.announced.length > 0 || s?.projected.length > 0;
+          return (
+            <button key={d} disabled={!hasActivity} onClick={() => onDaySelect({ ...s, dateLabel: `${monthName.split(' ')[0]} ${d}, ${date.getFullYear()}` })} className={`aspect-square rounded flex flex-col items-center justify-center border transition-all ${hasActivity ? (isDarkMode ? 'bg-indigo-500/10 border-indigo-500/30 hover:bg-indigo-500/20' : 'bg-indigo-50 border-indigo-100 hover:bg-indigo-100') : 'border-transparent text-slate-500'}`}>
+              <span className="text-[8px] font-bold">{d}</span>
+              {hasActivity && <div className="flex flex-col items-center mt-[-2px]">
+                {s.announced.length > 0 && <span className="text-[4px] font-black text-indigo-500 leading-none">A:{s.announced.length}</span>}
+                {s.projected.length > 0 && <span className="text-[4px] font-black text-emerald-500 leading-none">R:{s.projected.length}</span>}
+              </div>}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+const ArticleCard = ({ item, viewMode, favCats, isDarkMode, isTagged, onTagToggle, onClick }) => {
+  const isTimeline = viewMode === 'timeline';
+  const isStarred = favCats.includes(item.category) || item.detectedApps.some(app => true);
+  return (
+    <div className={`relative group cursor-pointer ${isTimeline ? '' : 'flex flex-col h-full'}`} onClick={onClick}>
+      {isTimeline && (
+        <div className={`absolute -left-6 sm:-left-8 top-1.5 z-10 w-5 h-5 sm:w-6 sm:h-6 rounded-full border shadow flex items-center justify-center transition-all group-hover:scale-110 ${isDarkMode ? 'border-slate-900' : 'border-white'} ${isStarred ? 'bg-yellow-400 text-yellow-900' : 'bg-indigo-600 text-white'}`}>
+          {isStarred ? <Star className="w-2.5 h-2.5 fill-current" /> : <Calendar className="w-2.5 h-2.5" />}
+        </div>
+      )}
+      <button onClick={onTagToggle} className={`absolute top-1.5 right-1.5 z-20 p-1 rounded-md border transition-all ${isTagged ? 'bg-indigo-600 border-indigo-600 text-white shadow-lg' : 'bg-white/10 backdrop-blur-md border-slate-300 text-slate-400 group-hover:border-indigo-400 opacity-0 group-hover:opacity-100'}`}>{isTagged ? <CheckSquare className="w-2.5 h-2.5" /> : <Square className="w-2.5 h-2.5" />}</button>
+      <div className={`rounded-lg p-2.5 border transition-all duration-200 ${isTagged ? 'ring-2 ring-indigo-500 ring-offset-2 dark:ring-offset-slate-950' : ''} ${isStarred ? (isDarkMode ? 'border-yellow-900/50 bg-yellow-500/5' : 'border-yellow-200 bg-yellow-50/10') : (isDarkMode ? 'bg-slate-900 border-slate-800 shadow-none' : 'bg-white border-slate-100 shadow-sm')} group-hover:shadow-md group-hover:-translate-y-0.5 ${!isTimeline ? 'flex-1 flex flex-col justify-between' : ''}`}>
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-1.5">
+            <div className="flex flex-wrap gap-1 pr-6">
+              <span className={`text-[6px] font-black py-0.5 px-1 rounded uppercase tracking-tighter ${isStarred ? 'bg-yellow-400 text-yellow-900' : (isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500')}`}>{item.category}</span>
+            </div>
+            <span className="text-[6px] text-slate-500 font-bold">{item.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>
+          </div>
+          <h3 className={`text-[10px] font-bold leading-snug group-hover:text-indigo-400 transition-colors line-clamp-3 ${isStarred ? (isDarkMode ? 'text-white' : 'text-slate-900') : (isDarkMode ? 'text-slate-200' : 'text-slate-800')}`}>{item.title}</h3>
+          <p className="text-slate-500 text-[8px] leading-relaxed line-clamp-2 opacity-80">{item.description}</p>
+        </div>
+        <div className="pt-1.5 flex flex-col gap-1 border-t border-slate-200/10 mt-1.5">
+          <div className="flex items-center justify-end flex-wrap gap-1">
+            {item.gaLabel && <div className="text-[5px] font-black text-emerald-600 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 uppercase tracking-tighter shadow-sm">GA: {item.gaLabel}</div>}
+            {item.previewLabel && <div className="text-[5px] font-black text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-100 uppercase tracking-tighter shadow-sm">PREV: {item.previewLabel}</div>}
+            <div className="flex items-center gap-0.5 text-[6px] font-black text-indigo-500 uppercase tracking-widest ml-0.5 opacity-70 group-hover:opacity-100 transition-opacity">INFO <ChevronRight className="w-1.5 h-1.5" /></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
